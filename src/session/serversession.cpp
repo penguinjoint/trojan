@@ -1,7 +1,7 @@
 /*
  * This file is part of the trojan project.
  * Trojan is an unidentifiable mechanism that helps you bypass GFW.
- * Copyright (C) 2017-2019  GreaterFire, wongsyrone
+ * Copyright (C) 2017-2020  The Trojan Authors.
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -153,7 +153,19 @@ void ServerSession::in_recv(const string &data) {
             }
         }
         string query_addr = valid ? req.address.address : config.remote_addr;
-        string query_port = to_string(valid ? req.address.port : config.remote_port);
+        string query_port = to_string([&]() {
+            if (valid) {
+                return req.address.port;
+            }
+            const unsigned char *alpn_out;
+            unsigned int alpn_len;
+            SSL_get0_alpn_selected(in_socket.native_handle(), &alpn_out, &alpn_len);
+            if (alpn_out == NULL) {
+                return config.remote_port;
+            }
+            auto it = config.ssl.alpn_port_override.find(string(alpn_out, alpn_out + alpn_len));
+            return it == config.ssl.alpn_port_override.end() ? config.remote_port : it->second;
+        }());
         if (valid) {
             out_write_buf = req.payload;
             if (req.command == TrojanRequest::UDP_ASSOCIATE) {
@@ -166,13 +178,13 @@ void ServerSession::in_recv(const string &data) {
                 Log::log_with_endpoint(in_endpoint, "requested connection to " + req.address.address + ':' + to_string(req.address.port), Log::INFO);
             }
         } else {
-            Log::log_with_endpoint(in_endpoint, "not trojan request, connecting to " + config.remote_addr + ':' + to_string(config.remote_port), Log::WARN);
+            Log::log_with_endpoint(in_endpoint, "not trojan request, connecting to " + query_addr + ':' + query_port, Log::WARN);
             out_write_buf = data;
         }
         sent_len += out_write_buf.length();
         auto self = shared_from_this();
         resolver.async_resolve(query_addr, query_port, [this, self, query_addr, query_port](const boost::system::error_code error, tcp::resolver::results_type results) {
-            if (error) {
+            if (error || results.size() == 0) {
                 Log::log_with_endpoint(in_endpoint, "cannot resolve remote server hostname " + query_addr + ": " + error.message(), Log::ERROR);
                 destroy();
                 return;
@@ -216,7 +228,7 @@ void ServerSession::in_recv(const string &data) {
                 Log::log_with_endpoint(in_endpoint, "tunnel established");
                 status = FORWARD;
                 out_async_read();
-                if (out_write_buf != "") {
+                if (!out_write_buf.empty()) {
                     out_async_write(out_write_buf);
                 } else {
                     in_async_read();
@@ -265,8 +277,9 @@ void ServerSession::udp_recv(const string &data, const udp::endpoint &endpoint) 
 void ServerSession::udp_sent() {
     if (status == UDP_FORWARD) {
         UDPPacket packet;
-        int packet_len = packet.parse(udp_data_buf);
-        if (packet_len == -1) {
+        size_t packet_len;
+        bool is_packet_valid = packet.parse(udp_data_buf, packet_len);
+        if (!is_packet_valid) {
             if (udp_data_buf.length() > MAX_LENGTH) {
                 Log::log_with_endpoint(in_endpoint, "UDP packet too long", Log::ERROR);
                 destroy();
@@ -280,7 +293,7 @@ void ServerSession::udp_sent() {
         string query_addr = packet.address.address;
         auto self = shared_from_this();
         udp_resolver.async_resolve(query_addr, to_string(packet.address.port), [this, self, packet, query_addr](const boost::system::error_code error, udp::resolver::results_type results) {
-            if (error) {
+            if (error || results.size() == 0) {
                 Log::log_with_endpoint(in_endpoint, "cannot resolve remote server hostname " + query_addr + ": " + error.message(), Log::ERROR);
                 destroy();
                 return;
@@ -319,7 +332,7 @@ void ServerSession::destroy() {
     }
     status = DESTROY;
     Log::log_with_endpoint(in_endpoint, "disconnected, " + to_string(recv_len) + " bytes received, " + to_string(sent_len) + " bytes sent, lasted for " + to_string(time(NULL) - start_time) + " seconds", Log::INFO);
-    if (auth && auth_password.size() > 0) {
+    if (auth && !auth_password.empty()) {
         auth->record(auth_password, recv_len, sent_len);
     }
     boost::system::error_code ec;
